@@ -7,7 +7,7 @@ from pathlib import Path
 
 IG_ID = "17841462639186718"  # sasil.kr
 API = "https://graph.facebook.com/v21.0"
-CDN = "https://cdn.jsdelivr.net/gh/ssong032/sasil-ig-cards@main"
+CDN = "https://raw.githubusercontent.com/ssong032/sasil-ig-cards/main"  # jsDelivr는 같은 이름 파일을 오래 캐시해서 raw 사용
 ROOT = Path(__file__).parent
 
 

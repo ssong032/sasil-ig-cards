@@ -7,7 +7,7 @@
 #   "caption": "인스타 캡션 (해시태그 3개 포함)",
 #   "slides": [
 #     {"type": "cover",   "tag": "지리 반전", "white": "흰 글씨\n두 줄", "yellow": "노란 글씨", "foot": "넘겨보세요  →"},
-#     {"type": "qa",      "tag": "상식 1", "q": "질문?", "verdict": "X", "body": "설명", "note": "출처: ..."},
+#     {"type": "qa",      "tag": "상식 1", "q": "질문?", "verdict": "X", "body": "설명", "note": "출처: ..."},  ← 질문 카드 + 정답 카드 2장이 됨
 #     {"type": "compare", "tag": "비교 1", "title": "A vs B", "rows": [["A", "1.0°", true], ["B", "0.5°", false]], "note": "설명"},
 #     {"type": "plain",   "tag": "그런데 왜?", "title": "제목", "body": "본문", "note": "회색 글씨", "foot": ""},
 #     {"type": "cta",     "accent": "저장해두고 친구한테 보내기", "sub": "팔로우하면\n내일 사실도 볼 수 있어요"}
@@ -57,9 +57,22 @@ def build(s, page, total):
         size = s.get("size", 112)
         check_text(s["white"], size, 900); check_text(s["yellow"], size, 900)
         return RP.cover(page, total, s.get("tag", ""), s["white"], s["yellow"], s.get("foot", "넘겨보세요  →"), size)
-    if t == "qa":
-        check_text(s["q"], 84, 900); check_text(s["body"], 52, 700); check_text(s.get("note", ""), 38, 500)
-        return RP.qa(page, total, s.get("tag", ""), s["q"], s["verdict"], s["body"], s.get("note", ""))
+    if t == "qa_q":  # 질문 카드: 정답은 다음 장
+        check_text(s["q"], 96, 900)
+        im, d = RI.base(page, total, s.get("tag", ""))
+        y = RI.text_block(d, (RI.PAD, 360), s["q"], RI.font(96, 900), RI.INK)
+        RI.text_block(d, (RI.PAD, y + 60), "O일까요, X일까요?", RI.font(60, 800), RI.ACCENT)
+        RI.footer(d, "정답은 다음 장에서  →")
+        return im
+    if t == "qa_a":  # 정답 카드: 질문을 작게 다시 보여주고 판정 + 설명
+        q1 = s["q"].replace("\n", " ")
+        check_text(q1, 40, 600); check_text(s["body"], 52, 700); check_text(s.get("note", ""), 38, 500)
+        im, d = RI.base(page, total, "정답")
+        d.text((RI.PAD, 300), q1, font=RI.font(40, 600), fill=RI.MUTED)
+        d.text((RI.PAD, 370), s["verdict"], font=RI.font(170, 900), fill=RI.ACCENT)
+        y = RI.text_block(d, (RI.PAD, 630), s["body"], RI.font(52, 700), RI.INK, 1.35)
+        RI.text_block(d, (RI.PAD, y + 40), s.get("note", ""), RI.font(38, 500), RI.MUTED, 1.4)
+        return im
     if t == "compare":
         check_text(s["title"], 84, 900); check_text(s.get("note", ""), 48, 700)
         for name, val, _ in s["rows"]:
@@ -80,9 +93,15 @@ def build(s, page, total):
 def main(ymd):
     out = ROOT / "posts" / ymd
     spec = json.loads((out / "spec.json").read_text(encoding="utf-8"))
-    slides = spec["slides"]
+    # qa 하나는 질문 카드 + 정답 카드 2장으로 나눈다 (정답은 넘겨야 보이게)
+    slides = []
+    for s in spec["slides"]:
+        if s["type"] == "qa":
+            slides += [{**s, "type": "qa_q"}, {**s, "type": "qa_a"}]
+        else:
+            slides.append(s)
     if not 3 <= len(slides) <= 10:
-        sys.exit(f"슬라이드 수 {len(slides)}: 3~10장이어야 합니다")
+        sys.exit(f"슬라이드 수 {len(slides)} (qa는 2장으로 계산): 3~10장이어야 합니다")
     cap = spec["caption"]
     if "—" in cap or "–" in cap:
         sys.exit("캡션에 긴 대시(— –)가 있습니다. 쉼표나 마침표로 바꾸세요.")

@@ -1,10 +1,10 @@
-// sasil.kr 승인 봇: 텔레그램 버튼 -> 인스타 캐러셀 게시 (매일 19:00 KST)
+// sasil.kr 승인 봇: 텔레그램 버튼 -> 인스타 캐러셀 게시 (매일 06:00 KST, 운세 계정과 동일)
 //
 // 흐름
 //   1. 매일 13:00 KST 클라우드 루틴이 다음 날 posts/D/{01..NN.jpg, manifest.json, qa.md}를 GitHub에 push.
-//   2. Cron(5분마다)이 14:00 KST부터 내일 manifest를 발견하면 텔레그램으로 미리보기 + 버튼을 보낸다.
+//   2. Cron(5분마다)이 15:00 KST부터 내일 manifest를 발견하면 텔레그램으로 미리보기 + 버튼을 보낸다.
 //   3. 사장님이 "승인"을 누르면 KV post:D 에 approved 로 기록.
-//   4. D일 19:00 KST부터 cron이 승인된 게시물을 인스타에 올리고 링크를 텔레그램으로 알린다.
+//   4. D일 06:00 KST부터 cron이 승인된 게시물을 인스타에 올리고 링크를 텔레그램으로 알린다.
 //
 // 운세 봇(fortune-ig-bot)을 바탕으로 했지만 계정·저장소·KV·텔레그램 봇이 모두 따로다.
 // Secrets: TELEGRAM_BOT_TOKEN, IG_ACCESS_TOKEN(짤모음 페이지 토큰, 만료 없음), WEBHOOK_SECRET
@@ -16,8 +16,8 @@ const CDN = `https://cdn.jsdelivr.net/gh/${REPO}@main`;
 const IG = "https://graph.facebook.com/v23.0";
 const IG_USER_ID = "17841462639186718"; // sasil.kr
 const KST = 9 * 3600 * 1000;
-const PUBLISH_HOUR = 19;
-const NOTIFY_FROM_HOUR = 14; // 루틴이 13:00에 만들고 push 하므로 14시부터 내일 것을 찾는다
+const PUBLISH_HOUR = 6; // 운세 계정과 같은 시각
+const NOTIFY_FROM_HOUR = 15; // 운세 계정과 같이 15시부터 내일 것을 찾는다 (루틴은 13:00에 push)
 const REMIND_HOUR = 23;
 const WD = ["일", "월", "화", "수", "목", "금", "토"];
 
@@ -145,7 +145,7 @@ async function publishCarousel(env, ymd, m) {
   const token = env.IG_ACCESS_TOKEN;
   const kids = [];
   for (const f of m.files.slice(0, 10)) {
-    const c = await igCall(`${IG}/${IG_USER_ID}/media`, { image_url: `${CDN}/posts/${ymd}/${f}`, is_carousel_item: "true", access_token: token });
+    const c = await igCall(`${IG}/${IG_USER_ID}/media`, { image_url: `${RAW}/posts/${ymd}/${f}`, is_carousel_item: "true", access_token: token });
     kids.push(c.id);
   }
   const car = await igCall(`${IG}/${IG_USER_ID}/media`, { media_type: "CAROUSEL", children: kids.join(","), caption: m.caption, access_token: token });
@@ -177,7 +177,7 @@ async function maybeNotify(env, now) {
   const chat = await owner(env);
   if (!chat) return;
   // 미리보기 사진을 먼저 보낸다. 실패하면 상태를 저장하지 않고 다음 tick에 처음부터 다시 시도한다.
-  const media = m.files.slice(0, 10).map((f) => ({ type: "photo", media: `${CDN}/posts/${target}/${f}` }));
+  const media = m.files.slice(0, 10).map((f) => ({ type: "photo", media: `${RAW}/posts/${target}/${f}` }));
   const mg = await tg(env, "sendMediaGroup", { chat_id: chat, media });
   if (!mg.ok) return;
   p.head = `📅 ${label(target)} sasil.kr 게시물 준비 완료\n🗂 주제: ${m.topic || "-"}\n\n✍️ 캡션 앞부분\n${(m.caption || "").split("\n").slice(0, 3).join("\n")}\n\n${await qaLine(target)}\n\n승인하면 ${label(target)} ${PUBLISH_HOUR}시에 자동 게시돼요.`;
@@ -273,6 +273,12 @@ export default {
     if (url.pathname === "/notify" && authed) {
       const d = url.searchParams.get("d");
       if (!isYmd(d)) return new Response("bad d", { status: 400 });
+      if (url.searchParams.get("force") === "1") {
+        // 카드가 바뀌었을 때 새 미리보기로 다시 보낸다. 예전 메시지의 버튼은 끄고, 승인 상태는 초기화한다.
+        const old = await getPost(env, d);
+        if (old.msg_id) await tg(env, "editMessageReplyMarkup", { chat_id: await owner(env), message_id: old.msg_id, reply_markup: { inline_keyboard: [] } });
+        await env.STATE.delete(`post:${d}`);
+      }
       await maybeNotify(env, { ymd: addDays(d, -1), hour: NOTIFY_FROM_HOUR });
       return new Response((await getPost(env, d)).msg_id ? "notified" : "no manifest / no owner");
     }

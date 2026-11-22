@@ -9,7 +9,8 @@ OUT_I = ROOT / "intro"
 OUT_P.mkdir(exist_ok=True)
 OUT_I.mkdir(exist_ok=True)
 
-FONT = r"C:\Windows\Fonts\NotoSansKR-VF.ttf"
+# 저장소에 넣은 폰트를 우선 사용 (클라우드 루틴에서도 같은 모양이 나오게)
+FONT = str(ROOT / "fonts" / "NotoSansKR-VF.ttf")
 BG = "#15171E"
 INK = "#F5F3EE"
 MUTED = "#9AA0AE"

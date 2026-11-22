@@ -1,0 +1,14 @@
+name = "sasil-ig-bot"
+main = "src/worker.js"
+compatibility_date = "2025-06-01"
+workers_dev = true
+
+# KV: 승인 상태, 사장님 텔레그램 chat id
+[[kv_namespaces]]
+binding = "STATE"
+id = "3e17f24f05a14be19255799493b99a60"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+# Secrets (커밋 금지): TELEGRAM_BOT_TOKEN, IG_ACCESS_TOKEN, WEBHOOK_SECRET

@@ -103,22 +103,22 @@ async function sendReport(env, ymd) {
 }
 
 // ---------- 승인 메시지 ----------
+const ICON = { approved: `✅ 승인 (${PUBLISH_HOUR}시 게시 예정)`, publishing: "⏳ 게시 중", processing: "⏳ 처리 중", published: "🎉 게시 완료", skipped: "⏭️ 건너뜀", error: "❌ 오류" };
 function statusLine(p) {
-  const s = p.state || "";
-  const icon = { approved: `✅ 승인 (${PUBLISH_HOUR}시 게시 예정)`, publishing: "⏳ 게시 중", published: "🎉 게시 완료", skipped: "⏭️ 건너뜀", error: "❌ 오류" }[s] || "⬜ 승인 전";
-  return `📸 캐러셀: ${icon}${p.link ? " " + p.link : ""}${p.err ? `\n(${p.err})` : ""}`;
+  const ig = `📸 인스타: ${ICON[p.state] || "⬜ 승인 전"}${p.link ? " " + p.link : ""}${p.err ? `\n(${p.err})` : ""}`;
+  if (!p.th_on) return ig;
+  return `${ig}\n🧵 쓰레드: ${ICON[p.th] || "⬜ 승인 전"}${p.th_link ? " " + p.th_link : ""}${p.th_err ? `\n(${p.th_err})` : ""}`;
 }
 function keyboard(ymd, p) {
   const report = [{ text: "📊 보고서 보기", callback_data: `B:${ymd}` }];
   const rows = [];
   if (!p.state) {
-    rows.push([{ text: `✅ ${PUBLISH_HOUR}시에 게시`, callback_data: `A:${ymd}` }]);
+    rows.push([{ text: `✅ ${PUBLISH_HOUR}시에 게시${p.th_on ? " (인스타+쓰레드)" : ""}`, callback_data: `A:${ymd}` }]);
     rows.push([{ text: "⏭️ 이번엔 건너뛰기", callback_data: `S:${ymd}` }]);
   } else if (p.state === "approved" || p.state === "skipped") {
     rows.push([{ text: "↩️ 취소", callback_data: `C:${ymd}` }]);
-  } else if (p.state === "error") {
-    rows.push([{ text: "🔁 다시 시도", callback_data: `R:${ymd}` }]);
   }
+  if (p.state === "error" || p.th === "error") rows.push([{ text: "🔁 오류 난 것 다시 시도", callback_data: `R:${ymd}` }]);
   rows.push(report);
   return { inline_keyboard: rows };
 }
@@ -160,6 +160,81 @@ async function publishCarousel(env, ymd, m) {
   catch (e) { return "(링크 확인 실패 · 게시는 완료)"; } // 이미 게시됨: 재시도하면 중복 게시되므로 오류로 두지 않는다
 }
 
+// ---------- 쓰레드 (운세 봇과 같은 2단계 방식) ----------
+// 토큰: THREADS_ACCESS_TOKEN secret(60일). 45일마다 자동 갱신해 KV th_token 에 저장.
+const TH = "https://graph.threads.net/v1.0";
+const TH_LIMIT = 500;
+const TH_TIMEOUT_MIN = 40;
+const TOKEN_REFRESH_DAYS = 45;
+async function thToken(env) { return (await env.STATE.get("th_token")) || env.THREADS_ACCESS_TOKEN || ""; }
+async function thUserId(env, token) {
+  let id = await env.STATE.get("th_user_id");
+  if (id) return id;
+  const me = await igCall(`${TH}/me`, { fields: "id,username", access_token: token }, "GET");
+  await env.STATE.put("th_user_id", me.id);
+  await env.STATE.put("th_username", me.username || "");
+  return me.id;
+}
+// 쓰레드는 글 500자, 주제 태그 1개만 연결되므로 해시태그 줄을 빼고 태그 하나만 붙인다.
+function threadsText(caption) {
+  const lines = caption.split("\n").filter((l) => !/^\s*(#\S+\s*)+$/.test(l)).map((l) => l.replace(/\s#\S+/g, ""));
+  let text = lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  const tail = "\n\n#신기한사실";
+  if (text.length + tail.length > TH_LIMIT) text = text.slice(0, TH_LIMIT - tail.length - 1).trimEnd() + "…";
+  return text + tail;
+}
+// 1단계: 사진 컨테이너만 만든다 (처리가 끝나기 전에 캐러셀로 묶으면 "Invalid parameter" 오류).
+async function startThreads(env, ymd, m) {
+  const token = await thToken(env);
+  if (!token) throw new Error("쓰레드 토큰 없음");
+  const uid = await thUserId(env, token);
+  const kids = [];
+  for (const f of m.files.slice(0, 20)) {
+    try {
+      const c = await igCall(`${TH}/${uid}/threads`, { media_type: "IMAGE", image_url: `${RAW}/posts/${ymd}/${f}`, is_carousel_item: "true", access_token: token });
+      kids.push(c.id);
+    } catch (e) { throw new Error(`쓰레드 사진 등록(${f}) 실패: ${e.message}`); }
+  }
+  return kids.join(",");
+}
+// 2단계: 사진이 모두 FINISHED 면 캐러셀을 만들어 게시하고 링크를 돌려준다. 아직 처리 중이면 null.
+async function finishThreads(env, kids, caption) {
+  const token = await thToken(env);
+  const uid = await thUserId(env, token);
+  for (const id of kids.split(",")) {
+    const s = await igCall(`${TH}/${id}`, { fields: "status,error_message", access_token: token }, "GET");
+    if (s.status === "ERROR" || s.status === "EXPIRED") throw new Error(`쓰레드 사진 처리 실패 (${s.error_message || s.status})`);
+    if (s.status !== "FINISHED") return null;
+  }
+  const car = await igCall(`${TH}/${uid}/threads`, { media_type: "CAROUSEL", children: kids, text: threadsText(caption), access_token: token });
+  for (let i = 0; i < 10; i++) {
+    const s = await igCall(`${TH}/${car.id}`, { fields: "status,error_message", access_token: token }, "GET");
+    if (s.status === "FINISHED") break;
+    if (s.status === "ERROR" || s.status === "EXPIRED") throw new Error(`쓰레드 캐러셀 처리 실패 (${s.error_message || s.status})`);
+    await sleep(3000);
+  }
+  const pub = await igCall(`${TH}/${uid}/threads_publish`, { creation_id: car.id, access_token: token });
+  // 게시는 이미 됐으므로 링크 조회만 실패해도 오류로 두지 않는다 (재시도하면 중복 게시됨)
+  try { return (await igCall(`${TH}/${pub.id}`, { fields: "permalink", access_token: token }, "GET")).permalink || "(링크 확인 실패 · 게시는 완료)"; }
+  catch (e) { return "(링크 확인 실패 · 게시는 완료)"; }
+}
+async function maybeRefreshThreads(env) {
+  const tok = await thToken(env);
+  if (!tok) return;
+  const ts = Number((await env.STATE.get("th_token_ts")) || 0);
+  if (!ts) { await env.STATE.put("th_token_ts", String(Date.now())); return; }
+  if (Date.now() - ts < TOKEN_REFRESH_DAYS * 86400e3) return;
+  try {
+    const j = await igCall("https://graph.threads.net/refresh_access_token", { grant_type: "th_refresh_token", access_token: tok }, "GET");
+    await env.STATE.put("th_token", j.access_token);
+    await env.STATE.put("th_token_ts", String(Date.now()));
+    await say(env, "🔑 sasil 쓰레드 토큰을 자동 갱신했어요 (다음 60일 유효).");
+  } catch (e) {
+    await env.STATE.put("th_token_ts", String(Date.now() - (TOKEN_REFRESH_DAYS - 1) * 86400e3)); // 내일 다시
+    await say(env, `⚠️ sasil 쓰레드 토큰 자동 갱신 실패: ${e.message}\n만료되면 쓰레드 게시만 멈춰요(인스타는 계속).`);
+  }
+}
+
 // ---------- cron ----------
 async function maybeNotify(env, now) {
   const target = now.hour >= NOTIFY_FROM_HOUR ? addDays(now.ymd, 1) : now.hour < PUBLISH_HOUR ? now.ymd : null;
@@ -180,35 +255,68 @@ async function maybeNotify(env, now) {
   const media = m.files.slice(0, 10).map((f) => ({ type: "photo", media: `${RAW}/posts/${target}/${f}` }));
   const mg = await tg(env, "sendMediaGroup", { chat_id: chat, media });
   if (!mg.ok) return;
-  p.head = `📅 ${label(target)} sasil.kr 게시물 준비 완료\n🗂 주제: ${m.topic || "-"}\n\n✍️ 캡션 앞부분\n${(m.caption || "").split("\n").slice(0, 3).join("\n")}\n\n${await qaLine(target)}\n\n승인하면 ${label(target)} ${PUBLISH_HOUR}시에 자동 게시돼요.`;
+  p.th_on = !!(await thToken(env));
+  p.head = `📅 ${label(target)} sasil.kr 게시물 준비 완료\n🗂 주제: ${m.topic || "-"}\n\n✍️ 캡션 앞부분\n${(m.caption || "").split("\n").slice(0, 3).join("\n")}\n\n${await qaLine(target)}\n\n승인하면 ${label(target)} ${PUBLISH_HOUR}시에${p.th_on ? " 인스타와 쓰레드에" : ""} 자동 게시돼요.`;
   const sent = await tg(env, "sendMessage", { chat_id: chat, text: `${p.head}\n\n${statusLine(p)}`, reply_markup: keyboard(target, p), disable_web_page_preview: true });
   if (!sent.ok) return; // 승인 메시지가 안 갔으면 다음 tick에 다시 (사진 중복은 감수)
   p.msg_id = sent.result.message_id;
   await putPost(env, target, p);
 }
 
+// 한 tick 에 한 가지 일만 한다 (Workers 서브요청 50개 한도): 인스타 게시 → 쓰레드 사진 등록 → 쓰레드 게시.
 async function maybePublish(env, now) {
   if (now.hour < PUBLISH_HOUR) return;
   const ymd = now.ymd;
   const p = await getPost(env, ymd);
-  if (p.state !== "approved") return;
-  p.state = "publishing"; await putPost(env, ymd, p);
-  try {
-    const m = await manifest(ymd);
-    if (!m) throw new Error("manifest 없음");
-    p.link = await publishCarousel(env, ymd, m);
-    p.state = "published"; delete p.err;
-    await putPost(env, ymd, p);
-    await say(env, `🎉 ${label(ymd)} sasil.kr 게시 완료!\n${p.link}`);
-  } catch (e) {
-    p.state = "error"; p.err = e.message; await putPost(env, ymd, p);
-    await say(env, `❌ ${label(ymd)} 게시 실패: ${e.message}\n승인 메시지의 '다시 시도'를 누르면 5분 안에 다시 올려요.`, { reply_to_message_id: p.msg_id });
+  if (p.state === "approved") {
+    p.state = "publishing"; await putPost(env, ymd, p);
+    try {
+      const m = await manifest(ymd);
+      if (!m) throw new Error("manifest 없음");
+      p.link = await publishCarousel(env, ymd, m);
+      p.state = "published"; delete p.err;
+      await putPost(env, ymd, p);
+      await say(env, `🎉 ${label(ymd)} sasil.kr 인스타 게시 완료!\n${p.link}`);
+    } catch (e) {
+      p.state = "error"; p.err = e.message; await putPost(env, ymd, p);
+      await say(env, `❌ ${label(ymd)} 인스타 게시 실패: ${e.message}\n승인 메시지의 '다시 시도'를 누르면 5분 안에 다시 올려요.`, { reply_to_message_id: p.msg_id });
+    }
+    return refreshControl(env, ymd, p);
   }
-  await refreshControl(env, ymd, p);
+  const fail = async (e) => {
+    p.th = "error"; p.th_err = e.message; delete p.th_kids; await putPost(env, ymd, p);
+    await say(env, `❌ ${label(ymd)} 쓰레드 게시 실패: ${e.message}\n승인 메시지의 '다시 시도'를 누르면 다시 올려요.`, { reply_to_message_id: p.msg_id });
+    await refreshControl(env, ymd, p);
+  };
+  if (p.th === "approved") {
+    try {
+      const m = await manifest(ymd);
+      if (!m) throw new Error("manifest 없음");
+      p.th_kids = await startThreads(env, ymd, m);
+      p.th = "processing"; p.th_t = Date.now(); delete p.th_err;
+      await putPost(env, ymd, p); await refreshControl(env, ymd, p);
+    } catch (e) { await fail(e); }
+    return;
+  }
+  if (p.th === "processing") {
+    try {
+      const m = await manifest(ymd);
+      if (!m) return; // 잠시 못 받으면 다음 tick 에
+      const link = await finishThreads(env, p.th_kids, m.caption);
+      if (link) {
+        p.th = "published"; p.th_link = link; delete p.th_kids; await putPost(env, ymd, p);
+        await say(env, `🧵 ${label(ymd)} sasil.kr 쓰레드 게시 완료!\n${link}`);
+        await refreshControl(env, ymd, p);
+      } else if (Date.now() - (p.th_t || 0) > TH_TIMEOUT_MIN * 60e3) {
+        await fail(new Error(`${TH_TIMEOUT_MIN}분 넘게 쓰레드 사진 처리가 끝나지 않음`));
+      }
+    } catch (e) { await fail(e); }
+  }
 }
 
 async function tick(env) {
   const now = kstNow();
+  await maybeRefreshThreads(env);
   await maybeNotify(env, now);
   await maybePublish(env, now);
 }
@@ -241,10 +349,17 @@ async function onUpdate(env, u) {
   if (op === "B") { await tg(env, "answerCallbackQuery", { callback_query_id: q.id, text: "보고서를 보내 드릴게요" }); return sendReport(env, ymd); }
   const p = await getPost(env, ymd), now = kstNow();
   let note = "";
-  if (op === "A" && !p.state) { p.state = "approved"; note = ymd === now.ymd && now.hour >= PUBLISH_HOUR ? "승인! 5분 안에 게시돼요" : `승인! ${PUBLISH_HOUR}시에 게시돼요`; }
-  else if (op === "S" && !p.state) { p.state = "skipped"; note = "이번 회차는 건너뛸게요"; }
-  else if (op === "C" && ["approved", "skipped"].includes(p.state)) { delete p.state; note = "취소했어요"; }
-  else if (op === "R" && p.state === "error") { p.state = "approved"; delete p.err; note = "5분 안에 다시 시도할게요"; }
+  if (op === "A" && !p.state) {
+    p.state = "approved"; if (p.th_on) p.th = "approved";
+    note = ymd === now.ymd && now.hour >= PUBLISH_HOUR ? "승인! 5분 안에 게시돼요" : `승인! ${PUBLISH_HOUR}시에 게시돼요`;
+  }
+  else if (op === "S" && !p.state) { p.state = "skipped"; if (p.th_on) p.th = "skipped"; note = "이번 회차는 건너뛸게요"; }
+  else if (op === "C" && ["approved", "skipped"].includes(p.state)) { delete p.state; if (["approved", "skipped"].includes(p.th)) delete p.th; note = "취소했어요"; }
+  else if (op === "R" && (p.state === "error" || p.th === "error")) {
+    if (p.state === "error") { p.state = "approved"; delete p.err; }
+    if (p.th === "error") { p.th = "approved"; delete p.th_err; }
+    note = "5분 안에 다시 시도할게요";
+  }
   else note = "이미 처리된 상태예요";
   await putPost(env, ymd, p);
   await tg(env, "answerCallbackQuery", { callback_query_id: q.id, text: note });
@@ -268,7 +383,17 @@ export default {
         const lim = await igCall(`${IG}/${IG_USER_ID}/content_publishing_limit`, { fields: "quota_usage,config", access_token: env.IG_ACCESS_TOKEN }, "GET");
         ig = { ok: true, username: me.username, publishing_limit: lim.data };
       } catch (e) { ig = { ok: false, error: e.message }; }
-      return Response.json({ webhook: hook, instagram: ig, owner_chat_set: !!(await owner(env)) });
+      let threads = { ok: false, error: "no THREADS_ACCESS_TOKEN" };
+      const tht = await thToken(env);
+      if (tht) {
+        try {
+          await env.STATE.delete("th_user_id");
+          const id = await thUserId(env, tht);
+          if (!(await env.STATE.get("th_token_ts"))) await env.STATE.put("th_token_ts", String(Date.now()));
+          threads = { ok: true, user_id: id, username: await env.STATE.get("th_username") };
+        } catch (e) { threads = { ok: false, error: e.message }; }
+      }
+      return Response.json({ webhook: hook, instagram: ig, threads, owner_chat_set: !!(await owner(env)) });
     }
     if (url.pathname === "/notify" && authed) {
       const d = url.searchParams.get("d");

@@ -149,8 +149,8 @@ def main(batch_dir):
     HERE = Path(batch_dir).resolve()
     batch = HERE.name
     data = json.loads((HERE / "issues.json").read_text(encoding="utf-8"))
-    if not 1 <= len(data) <= 5:
-        raise SystemExit(f"이슈 수 {len(data)}: 1~5개여야 합니다")
+    if not 1 <= len(data) <= 10:
+        raise SystemExit(f"이슈 수 {len(data)}: 1~10개여야 합니다")
     items = []
     for n, iss in enumerate(data, 1):
         cap = iss["caption"]

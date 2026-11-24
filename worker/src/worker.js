@@ -19,6 +19,9 @@ const KST = 9 * 3600 * 1000;
 const PUBLISH_HOUR = 6; // 운세 계정과 같은 시각
 const NOTIFY_FROM_HOUR = 15; // 운세 계정과 같이 15시부터 내일 것을 찾는다 (루틴은 13:00에 push)
 const REMIND_HOUR = 23;
+// 2026-11-25 CEO 결정: 승인 없이 자동 게시. 단 사실 정보 계정이라 검수(qa.md)가 '게시 가능' + 80점 이상일 때만
+// 자동 승인하고, 아니면 예전처럼 사장님 승인을 기다린다.
+const AUTO_PUBLISH = true, AUTO_MIN_SCORE = 80;
 const WD = ["일", "월", "화", "수", "목", "금", "토"];
 
 // ---------- 시간 (모든 날짜는 KST 기준) ----------
@@ -59,6 +62,13 @@ async function manifest(ymd) {
 // 최종 판정: "ok" | "hold" | "unknown". 못 읽으면 절대 "ok" 로 보지 않는다.
 function qaVerdict(qa) {
   const lines = qa.replace(/\r/g, "").split("\n");
+  const fin = lines.filter((l) => /최종\s*판정\s*[:：]/.test(l)).pop();
+  if (fin && /가능/.test(fin) && /보류/.test(fin)) return "unknown"; // 양식을 안 채운 채(가능|보류)면 판정 없음
+  if (fin) {
+    const fm = fin.replace(/^.*?최종\s*판정\s*[:：]/, "").replace(/가능\s*[\/|]\s*보류/g, " ")
+      .match(/(보류|불가|수정\s*후|조건부|\bhold\b|reject)|((?<!불)가능|\bpass\b|\bok\b)/i);
+    if (fm) return fm[1] ? "hold" : "ok";
+  }
   const idx = lines.findIndex((l) => /게시\s*가능\s*여부|최종\s*판정/.test(l));
   if (idx < 0) return "unknown";
   const clean = (l) => l.replace(/\(?\s*가능\s*\/\s*보류\s*\)?/g, " ").replace(/게시\s*가능\s*여부/g, " ").replace(/최종\s*판정/g, " ");
@@ -69,8 +79,7 @@ function qaVerdict(qa) {
   return "unknown";
 }
 function qaScore(qa) {
-  const src = qa.split("\n").find((l) => /품질/.test(l) && /\d/.test(l)) || qa;
-  const m = src.match(/(\d{1,3})\s*\/\s*100/) || src.match(/(\d{1,3})\s*점(?!\s*만점)/);
+  const m = qa.match(/품질[^\n\d]*?(\d{1,3})\s*(?:\/\s*100|점(?!\s*만점))/);
   return m && +m[1] <= 100 ? m[1] : null;
 }
 async function qaLine(ymd) {
@@ -236,7 +245,7 @@ async function maybeRefreshThreads(env) {
 }
 
 // ---------- cron ----------
-async function maybeNotify(env, now) {
+async function maybeNotify(env, now, opt = {}) {
   const target = now.hour >= NOTIFY_FROM_HOUR ? addDays(now.ymd, 1) : now.hour < PUBLISH_HOUR ? now.ymd : null;
   if (!target) return;
   const p = await getPost(env, target);
@@ -256,7 +265,13 @@ async function maybeNotify(env, now) {
   const mg = await tg(env, "sendMediaGroup", { chat_id: chat, media });
   if (!mg.ok) return;
   p.th_on = !!(await thToken(env));
-  p.head = `📅 ${label(target)} sasil.kr 게시물 준비 완료\n🗂 주제: ${m.topic || "-"}\n\n✍️ 캡션 앞부분\n${(m.caption || "").split("\n").slice(0, 3).join("\n")}\n\n${await qaLine(target)}\n\n승인하면 ${label(target)} ${PUBLISH_HOUR}시에${p.th_on ? " 인스타와 쓰레드에" : ""} 자동 게시돼요.`;
+  if (AUTO_PUBLISH && !opt.force && !p.state) {
+    const qa = (await rawText(`posts/${target}/qa.md`)) || "";
+    const v = qa.trim() ? qaVerdict(qa) : "unknown", sc = qa.trim() ? qaScore(qa) : null;
+    if (v === "ok" && sc !== null && +sc >= AUTO_MIN_SCORE) { p.state = "approved"; if (p.th_on) p.th = "approved"; p.auto = true; }
+    else p.auto_held = true;
+  }
+  p.head = `📅 ${label(target)} sasil.kr 게시물 준비 완료\n🗂 주제: ${m.topic || "-"}\n\n✍️ 캡션 앞부분\n${(m.caption || "").split("\n").slice(0, 3).join("\n")}\n\n${await qaLine(target)}\n\n${p.auto ? `🤖 검수 통과로 자동 승인됨: ${label(target)} ${PUBLISH_HOUR}시에${p.th_on ? " 인스타와 쓰레드에" : ""} 자동 게시돼요. 막으려면 아래 '취소'를 눌러 주세요.` : `⚠️ 검수 점수가 ${AUTO_MIN_SCORE}점 미만이거나 '게시 가능' 판정이 없어서 자동 게시를 멈췄어요. 확인 후 승인하면 ${label(target)} ${PUBLISH_HOUR}시에 게시돼요.`}`;
   const sent = await tg(env, "sendMessage", { chat_id: chat, text: `${p.head}\n\n${statusLine(p)}`, reply_markup: keyboard(target, p), disable_web_page_preview: true });
   if (!sent.ok) return; // 승인 메시지가 안 갔으면 다음 tick에 다시 (사진 중복은 감수)
   p.msg_id = sent.result.message_id;
@@ -354,7 +369,7 @@ async function onUpdate(env, u) {
     note = ymd === now.ymd && now.hour >= PUBLISH_HOUR ? "승인! 5분 안에 게시돼요" : `승인! ${PUBLISH_HOUR}시에 게시돼요`;
   }
   else if (op === "S" && !p.state) { p.state = "skipped"; if (p.th_on) p.th = "skipped"; note = "이번 회차는 건너뛸게요"; }
-  else if (op === "C" && ["approved", "skipped"].includes(p.state)) { delete p.state; if (["approved", "skipped"].includes(p.th)) delete p.th; note = "취소했어요"; }
+  else if (op === "C" && ["approved", "skipped"].includes(p.state)) { delete p.state; if (["approved", "skipped"].includes(p.th)) delete p.th; note = "취소했어요"; if (p.auto) { p.head = p.head.replace(/🤖[^\n]*/, "↩️ 자동 게시를 취소했어요. 승인 버튼을 누르면 다시 게시 예정이 돼요."); delete p.auto; } }
   else if (op === "R" && (p.state === "error" || p.th === "error")) {
     if (p.state === "error") { p.state = "approved"; delete p.err; }
     if (p.th === "error") { p.th = "approved"; delete p.th_err; }
@@ -404,7 +419,7 @@ export default {
         if (old.msg_id) await tg(env, "editMessageReplyMarkup", { chat_id: await owner(env), message_id: old.msg_id, reply_markup: { inline_keyboard: [] } });
         await env.STATE.delete(`post:${d}`);
       }
-      await maybeNotify(env, { ymd: addDays(d, -1), hour: NOTIFY_FROM_HOUR });
+      await maybeNotify(env, { ymd: addDays(d, -1), hour: NOTIFY_FROM_HOUR }, { force: url.searchParams.get("force") === "1" });
       return new Response((await getPost(env, d)).msg_id ? "notified" : "no manifest / no owner");
     }
     if (url.pathname === "/tick" && authed) { await tick(env); return new Response("tick done"); }

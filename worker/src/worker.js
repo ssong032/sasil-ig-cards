@@ -19,13 +19,17 @@ const KST = 9 * 3600 * 1000;
 const PUBLISH_HOUR = 6; // 운세 계정과 같은 시각
 const NOTIFY_FROM_HOUR = 15; // 운세 계정과 같이 15시부터 내일 것을 찾는다 (루틴은 13:00에 push)
 const REMIND_HOUR = 23;
-// 2026-11-25 CEO 결정: 승인 없이 자동 게시. 단 사실 정보 계정이라 검수(qa.md)가 '게시 가능' + 80점 이상일 때만
-// 자동 승인하고, 아니면 예전처럼 사장님 승인을 기다린다.
-const AUTO_PUBLISH = true, AUTO_MIN_SCORE = 80;
+// 2026-11-25 새벽 CEO 지시로 자동 게시를 멈춤: 다시 사장님이 텔레그램에서 승인해야만 게시한다.
+// (켜면 검수 '게시 가능' + 80점 이상일 때 자동 승인)
+const AUTO_PUBLISH = false, AUTO_MIN_SCORE = 80;
+// "오늘의 이슈" 묶음 (trend/<YYYY-MM-DD>-<am|pm>/batch.json): 승인 요청 시각, 게시 시각(null = 승인 즉시)
+const SLOTS = { am: { notify: "07:30", publish: "08:00", name: "오전" }, pm: { notify: "11:00", publish: null, name: "오후" } };
+const SLOT_GIVEUP_MIN = 240; // 승인 요청 시각에서 4시간이 지나도 batch.json 이 없으면 그날은 포기
 const WD = ["일", "월", "화", "수", "목", "금", "토"];
 
 // ---------- 시간 (모든 날짜는 KST 기준) ----------
-function kstNow() { const d = new Date(Date.now() + KST); return { ymd: d.toISOString().slice(0, 10), hour: d.getUTCHours() }; }
+function kstNow() { const d = new Date(Date.now() + KST); return { ymd: d.toISOString().slice(0, 10), hour: d.getUTCHours(), min: d.getUTCHours() * 60 + d.getUTCMinutes() }; }
+const hm = (s) => { const [h, m] = s.split(":").map(Number); return h * 60 + m; };
 function addDays(ymd, n) { const d = new Date(ymd + "T00:00:00Z"); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); }
 function label(ymd) { const d = new Date(ymd + "T00:00:00Z"); return `${d.getUTCMonth() + 1}/${d.getUTCDate()}(${WD[d.getUTCDay()]})`; }
 const isYmd = (v) => /^\d{4}-\d{2}-\d{2}$/.test(v || "") && !isNaN(new Date(v + "T00:00:00Z"));
@@ -150,11 +154,11 @@ async function igCall(url, params, method = "POST") {
   }
   return j;
 }
-async function publishCarousel(env, ymd, m) {
+async function publishCarousel(env, dir, m) { // dir: 저장소 안 폴더 (예: posts/2026-11-25, trend/2026-11-26-am)
   const token = env.IG_ACCESS_TOKEN;
   const kids = [];
   for (const f of m.files.slice(0, 10)) {
-    const c = await igCall(`${IG}/${IG_USER_ID}/media`, { image_url: `${RAW}/posts/${ymd}/${f}`, is_carousel_item: "true", access_token: token });
+    const c = await igCall(`${IG}/${IG_USER_ID}/media`, { image_url: `${RAW}/${dir}/${f}`, is_carousel_item: "true", access_token: token });
     kids.push(c.id);
   }
   const car = await igCall(`${IG}/${IG_USER_ID}/media`, { media_type: "CAROUSEL", children: kids.join(","), caption: m.caption, access_token: token });
@@ -288,7 +292,7 @@ async function maybePublish(env, now) {
     try {
       const m = await manifest(ymd);
       if (!m) throw new Error("manifest 없음");
-      p.link = await publishCarousel(env, ymd, m);
+      p.link = await publishCarousel(env, `posts/${ymd}`, m);
       p.state = "published"; delete p.err;
       await putPost(env, ymd, p);
       await say(env, `🎉 ${label(ymd)} sasil.kr 인스타 게시 완료!\n${p.link}`);
@@ -329,11 +333,115 @@ async function maybePublish(env, now) {
   }
 }
 
+// ---------- 오늘의 이슈 묶음 (trend/<배치>/batch.json) ----------
+// KV b:<배치> = { notified, items: { n: { state, msg_id, link, err } } }
+// 이슈마다 사진 4장 + 게시글 전문 + 버튼을 보내고, 승인된 것만 게시한다 (한 tick 에 1개).
+const BX_ICON = { publishing: "⏳ 게시 중", published: "🎉 게시 완료", skipped: "⏭️ 건너뜀", error: "❌ 오류" };
+async function getB(env, b) { return JSON.parse((await env.STATE.get(`b:${b}`)) || '{"items":{}}'); }
+async function putB(env, b, s) { await env.STATE.put(`b:${b}`, JSON.stringify(s), { expirationTtl: 60 * 60 * 24 * 7 }); }
+async function batchMeta(b) {
+  const t = await rawText(`trend/${b}/batch.json`);
+  try { return t ? JSON.parse(t) : null; } catch (e) { return null; }
+}
+function bxStatus(meta, it) {
+  const when = meta.publish_at ? `${meta.publish_at} 게시 예정` : "곧 게시";
+  const s = it.state === "approved" ? `✅ 승인 (${when})` : BX_ICON[it.state] || "⬜ 승인 전";
+  return `📸 인스타: ${s}${it.link ? " " + it.link : ""}${it.err ? `\n(${it.err})` : ""}`;
+}
+function bxKeyboard(b, meta, n, it) {
+  const rows = [];
+  if (!it.state) {
+    rows.push([{ text: `✅ 승인 (${meta.publish_at ? meta.publish_at + " 게시" : "바로 게시"})`, callback_data: `XA:${b}:${n}` }]);
+    rows.push([{ text: "⏭️ 건너뛰기", callback_data: `XS:${b}:${n}` }]);
+  } else if (it.state === "approved" || it.state === "skipped") rows.push([{ text: "↩️ 취소", callback_data: `XC:${b}:${n}` }]);
+  else if (it.state === "error") rows.push([{ text: "🔁 다시 시도", callback_data: `XR:${b}:${n}` }]);
+  return { inline_keyboard: rows };
+}
+function bxText(b, meta, item, it) {
+  const slot = SLOTS[b.split("-").pop()];
+  const qa = `🔍 검수: ${item.qa_score ? `품질 ${item.qa_score}점 · ` : ""}${item.qa_verdict || "판정 없음"}`;
+  return `🔥 ${slot ? slot.name + " " : ""}이슈 ${item.n}/${meta.items.length} · ${item.title}\n🔎 검색어: ${item.keyword || "-"}\n${qa}\n\n✍️ 게시글 (그대로 올라가요)\n━━━━━━━━━━\n${item.caption}\n━━━━━━━━━━\n\n${bxStatus(meta, it)}`;
+}
+async function bxRefresh(env, b, meta, n, it) {
+  if (!it.msg_id) return;
+  const item = meta.items.find((x) => String(x.n) === String(n));
+  await tg(env, "editMessageText", { chat_id: await owner(env), message_id: it.msg_id, disable_web_page_preview: true, text: bxText(b, meta, item, it), reply_markup: bxKeyboard(b, meta, n, it) });
+}
+async function sendBatch(env, b) {
+  const meta = await batchMeta(b);
+  const chat = await owner(env);
+  if (!meta || !meta.items || !meta.items.length || !chat) return false;
+  const s = await getB(env, b);
+  for (const item of meta.items) {
+    const it = s.items[item.n] || {};
+    if (it.msg_id) continue; // 이미 보낸 이슈
+    const mg = await tg(env, "sendMediaGroup", { chat_id: chat, media: item.files.map((f) => ({ type: "photo", media: `${RAW}/trend/${b}/${f}` })) });
+    if (!mg.ok) { await putB(env, b, s); return false; } // 다음 tick 에 남은 것부터
+    const sent = await tg(env, "sendMessage", { chat_id: chat, text: bxText(b, meta, item, it), reply_markup: bxKeyboard(b, meta, item.n, it), disable_web_page_preview: true });
+    if (!sent.ok) { await putB(env, b, s); return false; }
+    it.msg_id = sent.result.message_id; s.items[item.n] = it;
+  }
+  s.notified = true; await putB(env, b, s);
+  const act = JSON.parse((await env.STATE.get("b_active")) || "[]");
+  if (!act.includes(b)) { act.push(b); await env.STATE.put("b_active", JSON.stringify(act.slice(-10))); }
+  return true;
+}
+async function maybeNotifyBatches(env, now) {
+  for (const [slot, cfg] of Object.entries(SLOTS)) {
+    const at = hm(cfg.notify);
+    if (now.min < at || now.min > at + SLOT_GIVEUP_MIN) continue;
+    const b = `${now.ymd}-${slot}`;
+    if ((await getB(env, b)).notified) continue;
+    if (await sendBatch(env, b)) await say(env, `☝️ ${cfg.name} 이슈 승인 요청이에요. ${cfg.publish ? cfg.publish + "에" : "승인하면 바로"} 하나씩(5분 간격) 올라가요.`);
+  }
+}
+// 승인된 이슈 1개를 게시한다. 게시했으면 true.
+async function maybePublishBatches(env, now) {
+  const act = JSON.parse((await env.STATE.get("b_active")) || "[]");
+  for (const b of act) {
+    const s = await getB(env, b);
+    const pend = Object.entries(s.items).filter(([, it]) => it.state === "approved");
+    if (!pend.length) continue;
+    const meta = await batchMeta(b);
+    if (!meta) continue;
+    if (meta.publish_at && b.startsWith(now.ymd) && now.min < hm(meta.publish_at)) continue;
+    const [n, it] = pend.sort((a, c) => +a[0] - +c[0])[0];
+    const item = meta.items.find((x) => String(x.n) === n);
+    it.state = "publishing"; await putB(env, b, s);
+    try {
+      it.link = await publishCarousel(env, `trend/${b}`, item);
+      it.state = "published"; delete it.err;
+      await say(env, `🎉 이슈 게시 완료: ${item.title}\n${it.link}`, { reply_to_message_id: it.msg_id });
+    } catch (e) {
+      it.state = "error"; it.err = e.message;
+      await say(env, `❌ 이슈 게시 실패: ${item.title}\n${e.message}`, { reply_to_message_id: it.msg_id });
+    }
+    await putB(env, b, s); await bxRefresh(env, b, meta, n, it);
+    return true;
+  }
+  return false;
+}
+async function onBatchCallback(env, q) {
+  const [op, b, n] = q.data.split(":");
+  const s = await getB(env, b), it = s.items[n] || {};
+  let note = "이미 처리된 상태예요";
+  if (op === "XA" && !it.state) { it.state = "approved"; note = "승인! 게시 시각이 되면 올라가요"; }
+  else if (op === "XS" && !it.state) { it.state = "skipped"; note = "건너뛸게요"; }
+  else if (op === "XC" && ["approved", "skipped"].includes(it.state)) { delete it.state; note = "취소했어요"; }
+  else if (op === "XR" && it.state === "error") { it.state = "approved"; delete it.err; note = "5분 안에 다시 시도할게요"; }
+  s.items[n] = it; await putB(env, b, s);
+  await tg(env, "answerCallbackQuery", { callback_query_id: q.id, text: note });
+  const meta = await batchMeta(b);
+  if (meta) await bxRefresh(env, b, meta, n, it);
+}
+
 async function tick(env) {
   const now = kstNow();
   await maybeRefreshThreads(env);
   await maybeNotify(env, now);
   await maybePublish(env, now);
+  await maybeNotifyBatches(env, now);
+  await maybePublishBatches(env, now);
 }
 
 // ---------- 웹훅 ----------
@@ -360,6 +468,7 @@ async function onUpdate(env, u) {
   }
   const q = u.callback_query;
   if (!q || String(q.message.chat.id) !== chatOwner) return;
+  if (q.data.startsWith("X")) return onBatchCallback(env, q);
   const [op, ymd] = q.data.split(":");
   if (op === "B") { await tg(env, "answerCallbackQuery", { callback_query_id: q.id, text: "보고서를 보내 드릴게요" }); return sendReport(env, ymd); }
   const p = await getPost(env, ymd), now = kstNow();
@@ -421,6 +530,11 @@ export default {
       }
       await maybeNotify(env, { ymd: addDays(d, -1), hour: NOTIFY_FROM_HOUR }, { force: url.searchParams.get("force") === "1" });
       return new Response((await getPost(env, d)).msg_id ? "notified" : "no manifest / no owner");
+    }
+    if (url.pathname === "/notifyb" && authed) { // 이슈 묶음을 지금 바로 보낸다 (예: ?b=2026-11-25-sample)
+      const b = url.searchParams.get("b") || "";
+      if (!/^\d{4}-\d{2}-\d{2}-[a-z0-9]+$/.test(b)) return new Response("bad b", { status: 400 });
+      return new Response((await sendBatch(env, b)) ? "notified" : "no batch.json / no owner / send failed");
     }
     if (url.pathname === "/tick" && authed) { await tick(env); return new Response("tick done"); }
     return new Response("sasil-ig bot");
